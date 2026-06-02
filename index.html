@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="基于 Demucs V4 的三轨分离器，将音乐分离为人声、鼓组和其他三个独立音轨。"
+    />
+    <title>Demucs 3-Stem 分轨器</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>" />
+    <link rel="stylesheet" href="./styles.css?v=3" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero" aria-labelledby="app-title">
+        <div class="hero__content">
+          <p class="eyebrow">Demucs V4 Music Source Separation</p>
+          <h1 id="app-title">上传音乐，立即分轨</h1>
+          <p class="hero__copy">
+            基于 Demucs 深度学习模型，将音乐分离为人声、鼓组、其他三个独立音轨，支持文件上传和 URL 链接两种方式。
+          </p>
+          <div class="hero__badges" aria-label="功能特点">
+            <span>Demucs V4</span>
+            <span>Vocal / Drum / Other</span>
+            <span>API 支持</span>
+          </div>
+        </div>
+        <div class="hero__visual" aria-hidden="true">
+          <div class="orb orb--green"></div>
+          <div class="orb orb--blue"></div>
+          <div class="stems-card">
+            <div class="stems-card__tracks">
+              <div class="track-row">
+                <span class="track-icon">🎤</span>
+                <span class="track-name">Vocal</span>
+                <div class="track-bar"><div class="track-bar__fill" style="width: 85%"></div></div>
+              </div>
+              <div class="track-row">
+                <span class="track-icon">🥁</span>
+                <span class="track-name">Drum</span>
+                <div class="track-bar"><div class="track-bar__fill" style="width: 60%"></div></div>
+              </div>
+              <div class="track-row">
+                <span class="track-icon">🎹</span>
+                <span class="track-name">Other</span>
+                <div class="track-bar"><div class="track-bar__fill" style="width: 70%"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="分轨工作台">
+        <form class="upload-card" id="upload-form">
+          <div class="upload-card__header">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v11m0-11 4 4m-4-4-4 4M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" />
+            </svg>
+            <div>
+              <h2>上传音频</h2>
+              <p>支持 mp3、wav、m4a、ogg、flac 等常见音频格式。</p>
+            </div>
+          </div>
+
+          <label class="drop-zone" for="audio-file" id="drop-zone">
+            <input id="audio-file" type="file" accept="audio/*" />
+            <span class="drop-zone__title">选择或拖放音频文件</span>
+            <span class="drop-zone__hint">建议上传 10 秒到 10 分钟的音乐片段</span>
+          </label>
+
+          <div class="file-meta" id="file-meta" hidden></div>
+
+          <button class="primary-action" type="submit" id="separate-button" disabled>
+            开始分轨
+          </button>
+        </form>
+
+        <div class="status-card">
+          <div class="status-card__topline">
+            <div>
+              <p class="eyebrow">Processing Status</p>
+              <h2 id="status-title">等待音频</h2>
+            </div>
+            <span class="status-pill" id="status-pill">Idle</span>
+          </div>
+          <p class="status-copy" id="status-copy">
+            上传音频文件并选择模型后，点击开始分轨。处理时间取决于音频长度和服务器性能。
+          </p>
+          <div class="progress" aria-label="处理进度">
+            <span id="progress-bar"></span>
+          </div>
+
+          <div class="summary-grid" aria-label="处理摘要">
+            <div>
+              <span class="metric" id="file-name">--</span>
+              <span class="metric-label">文件名</span>
+            </div>
+            <div>
+              <span class="metric" id="file-duration">0:00</span>
+              <span class="metric-label">音频时长</span>
+            </div>
+            <div>
+              <span class="metric" id="model-used">3 轨</span>
+              <span class="metric-label">轨道数</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="results" aria-labelledby="results-title">
+        <div class="section-heading">
+          <p class="eyebrow">Results</p>
+          <h2 id="results-title">分轨结果</h2>
+        </div>
+
+        <!-- 混音控制栏 -->
+        <div class="mixer-controls" id="mixer-controls">
+          <div class="master-controls">
+            <button class="master-btn" id="play-all-btn" disabled title="全部播放">
+              <span class="btn-icon">▶</span>
+              <span class="btn-text">播放全部</span>
+            </button>
+            <button class="master-btn" id="stop-all-btn" disabled title="全部停止">
+              <span class="btn-icon">◼</span>
+              <span class="btn-text">停止</span>
+            </button>
+            <button class="master-btn" id="mute-all-btn" title="全部静音">
+              <span class="btn-icon">🔊</span>
+              <span class="btn-text">静音</span>
+            </button>
+          </div>
+          <div class="master-progress-wrap">
+            <input
+              type="range"
+              id="master-progress"
+              class="master-progress"
+              min="0"
+              max="1000"
+              value="0"
+              step="1"
+              disabled
+              aria-label="播放进度"
+            />
+            <div class="master-time" id="master-time">0:00 / 0:00</div>
+          </div>
+        </div>
+
+        <div class="stems-grid" id="stems-grid"></div>
+
+        <div class="download-all-section">
+          <button class="primary-action" id="download-all-button" disabled>
+            下载全部音轨 (ZIP)
+          </button>
+        </div>
+
+        
+      </section>
+
+      <footer class="app-author" aria-label="作者信息">
+        <p>
+          作者：<strong>猫仙森MRCAT</strong>
+          <span class="author-sep">|</span>
+          邮箱：<a href="mailto:valnebine@163.com">valnebine@163.com</a>
+          <span class="author-sep">|</span>
+          仓库：
+          <a href="https://github.com/valenbine/DemucsSeperater" target="_blank" rel="noreferrer noopener">
+            github.com/valenbine/DemucsSeperater
+          </a>
+        </p>
+      </footer>
+    </main>
+
+    <script type="module" src="./src/main.js?v=3"></script>
+  </body>
+</html>

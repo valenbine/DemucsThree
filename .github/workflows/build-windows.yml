@@ -1,0 +1,125 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate JavaScript syntax
+        run: |
+          node --check server.js
+          node --check src/main.js
+
+      - name: Generate Windows icon
+        run: node scripts/generate-windows-icon.mjs
+
+      - name: Install build tools globally
+        run: npm install -g pkg esbuild
+
+      - name: Install PowerShell packaging tools
+        shell: pwsh
+        run: Install-Module ps2exe -Scope CurrentUser -Force
+
+      - name: Bundle server entrypoint
+        shell: bash
+        run: |
+          mkdir -p dist/pkg
+          esbuild server.js \
+            --bundle \
+            --platform=node \
+            --format=cjs \
+            --target=node18 \
+            --outfile=dist/pkg/server.cjs
+
+      - name: Build Windows executable
+        shell: bash
+        run: |
+          mkdir -p dist
+          pkg dist/pkg/server.cjs \
+            --targets node18-win-x64 \
+            --output dist/DemucsSeperater.exe
+
+      - name: Prepare runtime assets
+        shell: bash
+        run: |
+          mkdir -p dist/assets
+          cp index.html dist/assets/
+          cp styles.css dist/assets/
+          cp analyze_audio.py dist/assets/
+          cp requirements.txt dist/assets/
+          cp -r src dist/assets/src
+          cp -r scripts dist/assets/scripts
+          cp packaging/windows/DemucsSeperater-Launcher.cmd dist/
+          cp packaging/windows/DemucsSeperater-Launcher.vbs dist/
+          cp packaging/windows/DemucsSeperater-Tray.ps1 dist/
+          cp packaging/windows/DemucsSeperater.svg dist/
+
+      - name: Build Windows tray controller
+        shell: pwsh
+        run: |
+          Invoke-ps2exe .\dist\DemucsSeperater-Tray.ps1 .\dist\DemucsSeperater-Tray.exe -noConsole -iconFile .\dist\DemucsSeperater.ico -title "DemucsSeperater" -description "DemucsSeperater tray controller" -company "猫仙森MRCAT" -product "DemucsSeperater"
+          if (-not (Test-Path "dist\DemucsSeperater-Tray.exe")) { throw "Tray executable was not created" }
+
+      - name: Bundle FFmpeg for Windows runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\bin | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip" -OutFile "dist\ffmpeg.zip"
+          Expand-Archive -Path "dist\ffmpeg.zip" -DestinationPath "dist\ffmpeg" -Force
+          $ffmpegBin = Get-ChildItem -Path "dist\ffmpeg" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1 | ForEach-Object { $_.Directory.FullName }
+          if (-not $ffmpegBin) { throw "ffmpeg.exe was not found in downloaded archive" }
+          Copy-Item "$ffmpegBin\*" "dist\bin" -Recurse -Force
+          if (-not (Test-Path "dist\bin\avcodec-*.dll")) { throw "FFmpeg shared DLLs were not found in bundled bin directory" }
+          & "dist\bin\ffmpeg.exe" -version
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          cd dist
+          powershell -Command "Compress-Archive -Path DemucsSeperater.exe,DemucsSeperater-Tray.exe,DemucsSeperater-Tray.ps1,DemucsSeperater.ico,DemucsSeperater.svg,DemucsSeperater-Launcher.cmd,DemucsSeperater-Launcher.vbs,assets,bin -DestinationPath DemucsSeperater-windows-x64.zip -Force"
+
+      - name: Build installer with Inno Setup
+        run: choco install innosetup -y
+
+      - name: Compile Setup.exe
+        run: iscc /DMyAppVersion=${{ github.ref_name }} build\\windows-installer.iss
+
+      - name: Publish Windows release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "windows-latest"
+          $title = "Latest Windows Build"
+          $notes = "Automated Windows build from $env:GITHUB_SHA."
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title $title --notes $notes --latest=false
+          }
+          gh release upload $tag `
+            dist\DemucsSeperater-windows-x64.zip `
+            dist\DemucsSeperater-Setup-x64.exe `
+            --repo $env:GITHUB_REPOSITORY `
+            --clobber
