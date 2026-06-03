@@ -204,6 +204,10 @@ function setSelectedFile(file) {
 
 async function loadAudioPreview(file) {
   try {
+    if (file.size > 50 * 1024 * 1024) {
+      fileDuration.textContent = "较大文件";
+      return;
+    }
     const ctx = initAudioContext();
     const arrayBuffer = await file.arrayBuffer();
     const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
@@ -282,26 +286,140 @@ async function startSeparation() {
   resetStemStates();
   resetMergedTrack();
   updateSelectionSummary();
-  setStatus("正在上传", "Uploading", "正在上传音频文件到服务器...", 5);
+
+  const file = selectedFile;
+  setStatus("正在上传", "Uploading", `${formatBytes(file.size)} 文件上传中...`, 2);
+  console.log("[startSeparation] start, uploading", file.name);
+
+  const timeout = Math.max(60000, (file.size / (1024 * 1024)) * 120000);
+
   try {
-    const formData = new FormData();
-    formData.append("file", selectedFile);
-    const response = await fetch("/api/separate", { method: "POST", body: formData });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.message || "分轨任务创建失败。");
+    const data = await uploadWithProgress(file, timeout);
+    console.log("[startSeparation] upload result:", data);
 
-    threeStemJobId = data.jobId;
-    threeStemUrls = {
-      vocal: data.vocal,
-      drum: data.drum,
-      other: data.other,
-    };
+    if (!data || !data.jobId) throw new Error("服务器未返回有效结果。");
 
-    handleThreeStemCompletion(data);
+    // 启动轮询
+    console.log("[startSeparation] starting pollJob for", data.jobId);
+    await pollJob(data.jobId);
   } catch (error) {
-    setStatus("分轨失败", "Error", error.message, 0, true);
+    console.error("[startSeparation] error:", error);
+    setStatus("分轨失败", "Error", error.message || "未知错误", 0, true);
     setBusy(false);
   }
+}
+
+function uploadWithProgress(file, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const timer = setTimeout(() => {
+      xhr.abort();
+      reject(new Error("上传超时"));
+    }, timeoutMs);
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) {
+        const pct = Math.round((event.loaded / event.total) * 95);
+        if (pct >= 95) {
+          setStatus("正在分离", "Processing", "文件传输完成，AI 正在分离音轨，请稍候...", 95);
+        } else {
+          setStatus("正在上传", "Uploading", `${formatBytes(file.size)} 已上传 ${formatBytes(event.loaded)} (${pct}%)`, pct);
+        }
+      }
+    });
+
+    xhr.addEventListener("load", () => {
+      clearTimeout(timer);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          resolve(data);
+        } catch {
+          reject(new Error("服务器返回数据格式错误。"));
+        }
+      } else {
+        try {
+          const err = JSON.parse(xhr.responseText);
+          reject(new Error(err.message || `上传失败 (${xhr.status})`));
+        } catch {
+          reject(new Error(`上传失败 (${xhr.status})`));
+        }
+      }
+    });
+
+    xhr.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("网络错误，上传中断。"));
+    });
+
+    xhr.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(new Error("上传已终止。"));
+    });
+
+    xhr.open("POST", "/api/separate");
+    xhr.send(formData);
+  });
+}
+
+async function pollJob(jobId) {
+  console.log("[pollJob] starting for", jobId);
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      try {
+        console.log("[pollJob] fetching status for", jobId);
+        const res = await fetch(`/api/status/${jobId}`);
+        const data = await res.json();
+        console.log("[pollJob] status:", data);
+        
+        if (data.status === "failed") {
+          clearInterval(interval);
+          setBusy(false);
+          reject(new Error(data.error || "分轨失败"));
+        } else if (data.status === "completed") {
+          clearInterval(interval);
+          setStatus("分轨完成", "Completed", "已分离为人声、鼓组、其他三个音轨。", 100);
+          
+          threeStemJobId = jobId;
+          // 如果服务端返回 urls
+          if (data.urls) {
+            threeStemUrls = {
+              vocal: data.urls.vocal || `/api/download3/${jobId}/vocal`,
+              drum: data.urls.drum || `/api/download3/${jobId}/drum`,
+              other: data.urls.other || `/api/download3/${jobId}/other`,
+            };
+          } else {
+            threeStemUrls = {
+              vocal: `/api/download3/${jobId}/vocal`,
+              drum: `/api/download3/${jobId}/drum`,
+              other: `/api/download3/${jobId}/other`,
+            };
+          }
+          console.log("[pollJob] completed, showing stems");
+
+          handleThreeStemCompletion({
+            jobId: jobId,
+            vocal: threeStemUrls.vocal,
+            drum: threeStemUrls.drum,
+            other: threeStemUrls.other,
+          });
+          resolve();
+        } else {
+          // 正在处理中
+          const currentProgress = parseInt(data.progress) || 0;
+          let statusText = "AI 正在分离音轨";
+          if (data.status === "separating") statusText = "正在分离模型分析...";
+          if (data.status === "merging") statusText = "正在合并其他音轨...";
+          setStatus("正在分离", "Processing", `${statusText} (进度 ${currentProgress}%)`, currentProgress + 20 < 100 ? currentProgress + 20 : 90);
+        }
+      } catch (e) {
+        console.error("Polling error:", e);
+      }
+    }, 2000);
+  });
 }
 
 function handleThreeStemCompletion(data) {

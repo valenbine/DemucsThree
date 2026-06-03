@@ -1,15 +1,14 @@
-import { spawn } from "node:child_process";
-import { appendFileSync, createReadStream, createWriteStream, mkdirSync, unlink, existsSync } from "node:fs";
-import { mkdir as mkdirAsync, stat, readdir } from "node:fs/promises";
-import http from "node:http";
-import https from "node:https";
-import os from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
-import archiver from "archiver";
+const { spawn } = require("node:child_process");
+const { appendFileSync, createReadStream, createWriteStream, mkdirSync, unlink, existsSync } = require("node:fs");
+const { mkdir: mkdirAsync, stat, readdir } = require("node:fs/promises");
+const http = require("node:http");
+const https = require("node:https");
+const os = require("node:os");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+const archiver = require("archiver");
 
-const MODULE_ROOT = typeof __dirname === "string" ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+const MODULE_ROOT = __dirname;
 const APP_ROOT = process.pkg
   ? path.join(path.dirname(process.execPath), "assets")
   : MODULE_ROOT;
@@ -30,7 +29,7 @@ const DEMUCS_ARGS = DEMUCS_CMD.startsWith("python3") ? DEMUCS_CMD.split(" ") : [
 const DEMUCS_BIN = DEMUCS_ARGS[0];
 const DEMUCS_PRE_ARGS = DEMUCS_ARGS.length > 1 ? DEMUCS_ARGS.slice(1) : [];
 const HEALTH_CHECK_TIMEOUT_MS = 30000;
-const MAX_UPLOAD_BYTES = 120 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 600 * 1024 * 1024;
 const AUTO_DELETE_HOURS = 1;
 const AVAILABLE_MODELS = [
   { id: "htdemucs", name: "htdemucs (标准)", stemCounts: [2, 4] },
@@ -326,6 +325,7 @@ async function handleStatus(request, response, jobId) {
     error: job.error,
     stems: job.stems,
     merges: job.merges,
+    urls: job.urls, // 包含分离结果链接
     message: job.status === "completed" ? "分轨完成" : "处理中",
   });
 }
@@ -600,9 +600,23 @@ async function handleSeparateByUrl(request, response, contentType) {
 
     await mkdirAsync(job.outputDir, { recursive: true });
 
-    const result = await runDemucsForSeparate(job);
+    jobs.set(jobId, job);
 
-    sendJson(response, 200, result);
+    // 立即返回 jobId
+    sendJson(response, 200, { jobId });
+
+    // 后台运行分离任务
+    runDemucsForSeparate(job)
+      .then((urls) => {
+        job.status = "completed";
+        job.progress = 100;
+        job.urls = urls;
+      })
+      .catch((err) => {
+        job.status = "failed";
+        job.error = err.message;
+        console.error("[job failed]", jobId, err);
+      });
   } catch (error) {
     sendJson(response, error.statusCode || 500, {
       error: error.code || "separate_failed",
@@ -621,39 +635,142 @@ async function handleSeparateByFile(request, response, contentType) {
       });
     }
 
-    const body = await readRequestBody(request, MAX_UPLOAD_BYTES);
-    const file = await extractMultipartFile(body, boundary);
+    const jobId = `sep_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const boundaryStr = `--${boundary}`;
+    const boundaryEndStr = `${boundaryStr}--`;
 
-    if (!file) {
+    let totalReceived = 0;
+    let fileName = "upload.audio";
+    let state = "headers";
+    let headerBuffer = "";
+    let outputStream = null;
+    let uploadPath = null;
+    let isFinished = false;
+
+    const uploadPromise = new Promise((resolve, reject) => {
+      request.on("data", (chunk) => {
+        totalReceived += chunk.length;
+        if (totalReceived > MAX_UPLOAD_BYTES) {
+          request.destroy();
+          reject(new Error("上传文件过大。"));
+          return;
+        }
+
+        if (isFinished) return;
+
+        if (state === "headers") {
+          headerBuffer += chunk.toString("latin1");
+          const headerEnd = headerBuffer.indexOf("\r\n\r\n");
+          if (headerEnd !== -1) {
+            const headers = headerBuffer.slice(0, headerEnd);
+            const fnMatch = headers.match(/filename="([^"]+)"/);
+            if (fnMatch) {
+              fileName = path.basename(fnMatch[1]).replace(/[^a-zA-Z0-9._-]/g, "_");
+              uploadPath = path.join(UPLOAD_DIR, `${Date.now()}-${fileName}`);
+              outputStream = createWriteStream(uploadPath);
+              outputStream.on("error", (err) => reject(err));
+            }
+            headerBuffer = "";
+            const afterHeader = chunk.slice(headerEnd + 4);
+            state = "file";
+            if (afterHeader.length > 0) writeToFileChunk(afterHeader);
+          } else if (headerBuffer.length > 8192) {
+            request.destroy();
+            reject(new Error("请求头过大。"));
+          }
+        } else if (state === "file") {
+          writeToFileChunk(chunk);
+        }
+      });
+
+      function writeToFileChunk(chunk) {
+        if (!outputStream || isFinished) return;
+        
+        // 检查是否包含结束边界
+        const chunkStr = chunk.toString("utf-8");
+        const endIdx = chunkStr.indexOf(boundaryEndStr);
+        if (endIdx !== -1) {
+          const content = Buffer.from(chunkStr.slice(0, endIdx).replace(/\r\n$/, ""), "utf-8");
+          outputStream.end(content, () => {
+            isFinished = true;
+            resolve({ path: uploadPath, fileName, size: totalReceived });
+          });
+          return;
+        }
+
+        const midIdx = chunkStr.indexOf(boundaryStr);
+        if (midIdx !== -1) {
+          const content = Buffer.from(chunkStr.slice(0, midIdx).replace(/\r\n$/, ""), "utf-8");
+          outputStream.end(content, () => {
+            isFinished = true;
+            resolve({ path: uploadPath, fileName, size: totalReceived });
+          });
+          return;
+        }
+
+        outputStream.write(chunk);
+      }
+
+      request.on("end", () => {
+        if (outputStream && !outputStream.destroyed) {
+          outputStream.end(() => {
+            isFinished = true;
+            resolve({ path: uploadPath, fileName, size: totalReceived });
+          });
+        } else if (!isFinished) {
+          resolve(null);
+        }
+      });
+
+      request.on("error", reject);
+    });
+
+    console.log("[upload] waiting for stream...");
+    const fileInfo = await uploadPromise;
+    console.log("[upload] stream done, file:", fileInfo?.path);
+
+    if (!fileInfo) {
       return sendJson(response, 400, {
         error: "missing_file",
-        message: "没有找到名为 file 的音频字段。",
+        message: "没有找到文件数据。",
       });
     }
 
-    const jobId = `sep_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const job = {
       id: jobId,
       status: "processing",
       progress: 0,
-      fileName: file.fileName,
+      fileName: fileInfo.fileName,
       model: "htdemucs",
       stemCount: 3,
       stems: {},
       merges: {},
       createdAt: Date.now(),
-      inputPath: file.path,
+      inputPath: fileInfo.path,
       outputDir: path.join(SEPARATED_DIR, jobId),
     };
 
     await mkdirAsync(job.outputDir, { recursive: true });
-
     jobs.set(jobId, job);
 
-    const result = await runDemucsForSeparate(job);
+    // 立即返回 jobId
+    sendJson(response, 200, { jobId });
 
-    sendJson(response, 200, result);
+    // 后台运行分离任务
+    runDemucsForSeparate(job)
+      .then((urls) => {
+        job.status = "completed";
+        job.progress = 100;
+        job.urls = urls;
+        console.log("[job completed]", jobId);
+      })
+      .catch((err) => {
+        job.status = "failed";
+        job.error = err.message;
+        console.error("[job failed]", jobId, err);
+      });
   } catch (error) {
+    console.error("[upload] handler error:", error);
     sendJson(response, error.statusCode || 500, {
       error: error.code || "separate_failed",
       message: error.message || "分轨处理失败。",
@@ -665,9 +782,15 @@ async function runDemucsForSeparate(job) {
   job.status = "separating";
   job.progress = 20;
 
+  console.log(`[debug] runDemucsForSeparate: input=${job.inputPath}, outputDir=${job.outputDir}`);
+
   const modelArg = "htdemucs";
   const args = ["-o", job.outputDir, "-n", modelArg, job.inputPath];
+  console.log(`[debug] running: ${DEMUCS_BIN} ${DEMUCS_PRE_ARGS.join(" ")} ${args.join(" ")}`);
+
   const result = await runCommand(DEMUCS_BIN, [...DEMUCS_PRE_ARGS, ...args], 600000);
+
+  console.log(`[debug] demucs result: code=${result.code}, stderr=${result.stderr?.slice(0, 200)}`);
 
   if (result.code !== 0) {
     throw new Error(`Demucs 执行失败: ${result.stderr || result.stdout}`);
@@ -696,7 +819,8 @@ async function runDemucsForSeparate(job) {
       throw new Error(`合并 Bass+Other 失败: ${mergeResult.stderr || mergeResult.stdout}`);
     }
   } else if (existsSync(otherPath)) {
-    await import("node:fs/promises").then((fs) => fs.copyFile(otherPath, mergedOtherPath));
+    const fs = require("node:fs/promises");
+    await fs.copyFile(otherPath, mergedOtherPath);
   } else {
     throw new Error("未找到 other 音轨文件。");
   }
@@ -711,7 +835,7 @@ async function runDemucsForSeparate(job) {
     other: mergedOtherPath,
   };
 
-  const fs = await import("node:fs/promises");
+  const fs = require("node:fs/promises");
 
   for (const [name, src] of Object.entries({ vocals: vocalsPath, drums: drumsPath })) {
     const dest = stemsMap[name === "vocals" ? "vocal" : "drum"];
