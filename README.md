@@ -360,3 +360,13 @@ curl -X POST http://localhost:3000/api/stems \
 | 500 | `separate_failed` | 上传、下载或分轨流程失败 |
 | 500 | `stems_failed` | `/api/stems` 分轨流程失败 |
 | 500 | `merge_failed` | 音轨合并失败 |
+
+## 许可
+
+本项目代码采用 MIT License，详见 [LICENSE](./LICENSE)。
+
+本项目基于 Demucs 提供音频分离能力，通过本地 Python / Demucs 命令执行模型推理。Demucs 是由 Meta Platforms, Inc. and affiliates 发布的开源项目，同样采用 MIT License。
+
+Demucs 上游项目：<https://github.com/facebookresearch/demucs>
+
+使用、分发或打包本项目时，请同时遵守本项目许可、Demucs 上游许可，以及 PyTorch、FFmpeg、Node.js 依赖和模型权重各自适用的许可条款。
