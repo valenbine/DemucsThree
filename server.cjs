@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const archiver = require("archiver");
+const Busboy = require("busboy");
 
 const MODULE_ROOT = __dirname;
 const APP_ROOT = process.pkg
@@ -111,6 +112,9 @@ const server = http.createServer(async (request, response) => {
     });
   }
 });
+
+server.requestTimeout = 30 * 60 * 1000;
+server.headersTimeout = 2 * 60 * 1000;
 
 server.on("error", (error) => {
   console.error("Server listen error:", error);
@@ -333,7 +337,7 @@ async function handleStatus(request, response, jobId) {
 async function handleDownload(request, response, jobId, stem) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const forceDownload = requestUrl.searchParams.get("download") === "1";
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId) || await restoreCompletedThreeStemJob(jobId);
 
   if (!job || job.status !== "completed") {
     return sendJson(response, 404, {
@@ -409,7 +413,7 @@ async function handleDownload(request, response, jobId, stem) {
 async function handleDownload3(request, response, jobId, stem) {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   const forceDownload = requestUrl.searchParams.get("download") === "1";
-  const job = jobs.get(jobId);
+  const job = jobs.get(jobId) || await restoreCompletedThreeStemJob(jobId);
 
   console.log("[DEBUG] handleDownload3:", jobId, stem, "job found:", !!job, "status:", job?.status, "stems3:", !!job?.stems3);
 
@@ -486,6 +490,32 @@ async function handleDownload3(request, response, jobId, stem) {
   });
 
   createReadStream(filePath).pipe(response);
+}
+
+async function restoreCompletedThreeStemJob(jobId) {
+  const outputDir = path.join(SEPARATED_DIR, jobId);
+  const stems3 = {
+    vocal: path.join(outputDir, "vocals.wav"),
+    drum: path.join(outputDir, "drums.wav"),
+    other: path.join(outputDir, "other.wav"),
+  };
+
+  for (const filePath of Object.values(stems3)) {
+    const fileStat = await stat(filePath).catch(() => null);
+    if (!fileStat?.isFile()) return null;
+  }
+
+  const job = {
+    id: jobId,
+    status: "completed",
+    progress: 100,
+    stems: {},
+    stems3,
+    merges: {},
+    outputDir,
+  };
+  jobs.set(jobId, job);
+  return job;
 }
 
 async function handleMerge(request, response) {
@@ -627,136 +657,62 @@ async function handleSeparateByUrl(request, response, contentType) {
 
 async function handleSeparateByFile(request, response, contentType) {
   try {
-    const boundary = contentType.match(/boundary=(.+)$/)?.[1];
-    if (!boundary) {
-      return sendJson(response, 400, {
-        error: "invalid_upload",
-        message: "multipart/form-data 请求缺少 boundary。",
-      });
-    }
-
-    const jobId = `sep_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const boundaryStr = `--${boundary}`;
-    const boundaryEndStr = `${boundaryStr}--`;
-
-    let totalReceived = 0;
-    let fileName = "upload.audio";
-    let state = "headers";
-    let headerBuffer = "";
-    let outputStream = null;
-    let uploadPath = null;
-    let isFinished = false;
-
-    const uploadPromise = new Promise((resolve, reject) => {
-      request.on("data", (chunk) => {
-        totalReceived += chunk.length;
-        if (totalReceived > MAX_UPLOAD_BYTES) {
-          request.destroy();
-          reject(new Error("上传文件过大。"));
-          return;
-        }
-
-        if (isFinished) return;
-
-        if (state === "headers") {
-          headerBuffer += chunk.toString("latin1");
-          const headerEnd = headerBuffer.indexOf("\r\n\r\n");
-          if (headerEnd !== -1) {
-            const headers = headerBuffer.slice(0, headerEnd);
-            const fnMatch = headers.match(/filename="([^"]+)"/);
-            if (fnMatch) {
-              fileName = path.basename(fnMatch[1]).replace(/[^a-zA-Z0-9._-]/g, "_");
-              uploadPath = path.join(UPLOAD_DIR, `${Date.now()}-${fileName}`);
-              outputStream = createWriteStream(uploadPath);
-              outputStream.on("error", (err) => reject(err));
-            }
-            headerBuffer = "";
-            const afterHeader = chunk.slice(headerEnd + 4);
-            state = "file";
-            if (afterHeader.length > 0) writeToFileChunk(afterHeader);
-          } else if (headerBuffer.length > 8192) {
-            request.destroy();
-            reject(new Error("请求头过大。"));
-          }
-        } else if (state === "file") {
-          writeToFileChunk(chunk);
-        }
-      });
-
-      function writeToFileChunk(chunk) {
-        if (!outputStream || isFinished) return;
-        
-        // 检查是否包含结束边界
-        const chunkStr = chunk.toString("utf-8");
-        const endIdx = chunkStr.indexOf(boundaryEndStr);
-        if (endIdx !== -1) {
-          const content = Buffer.from(chunkStr.slice(0, endIdx).replace(/\r\n$/, ""), "utf-8");
-          outputStream.end(content, () => {
-            isFinished = true;
-            resolve({ path: uploadPath, fileName, size: totalReceived });
-          });
-          return;
-        }
-
-        const midIdx = chunkStr.indexOf(boundaryStr);
-        if (midIdx !== -1) {
-          const content = Buffer.from(chunkStr.slice(0, midIdx).replace(/\r\n$/, ""), "utf-8");
-          outputStream.end(content, () => {
-            isFinished = true;
-            resolve({ path: uploadPath, fileName, size: totalReceived });
-          });
-          return;
-        }
-
-        outputStream.write(chunk);
-      }
-
-      request.on("end", () => {
-        if (outputStream && !outputStream.destroyed) {
-          outputStream.end(() => {
-            isFinished = true;
-            resolve({ path: uploadPath, fileName, size: totalReceived });
-          });
-        } else if (!isFinished) {
-          resolve(null);
-        }
-      });
-
-      request.on("error", reject);
-    });
-
-    console.log("[upload] waiting for stream...");
-    const fileInfo = await uploadPromise;
-    console.log("[upload] stream done, file:", fileInfo?.path);
-
-    if (!fileInfo) {
-      return sendJson(response, 400, {
-        error: "missing_file",
-        message: "没有找到文件数据。",
-      });
-    }
+    const contentLength = parseInt(request.headers["content-length"] || "0");
+    const clientJobId = request.headers["x-job-id"];
+    const jobId = clientJobId || `sep_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`[upload] request received, jobId=${jobId}, clientJobId=${clientJobId}, size=${contentLength}`);
 
     const job = {
       id: jobId,
-      status: "processing",
+      status: "uploading",
       progress: 0,
-      fileName: fileInfo.fileName,
+      fileName: "uploading...",
       model: "htdemucs",
       stemCount: 3,
       stems: {},
       merges: {},
       createdAt: Date.now(),
-      inputPath: fileInfo.path,
+      uploadTotal: contentLength,
+      uploadReceived: 0,
+      inputPath: null,
       outputDir: path.join(SEPARATED_DIR, jobId),
     };
 
     await mkdirAsync(job.outputDir, { recursive: true });
     jobs.set(jobId, job);
 
-    // 立即返回 jobId
+    console.log("[upload] waiting for stream, jobId:", jobId);
+    const fileInfo = await receiveUploadedFile(request, contentType, job, contentLength);
+    console.log("[upload] stream done, file:", fileInfo?.path);
+
+    if (!fileInfo) {
+      job.status = "failed";
+      job.error = "没有找到文件数据。";
+      return sendJson(response, 400, {
+        error: "missing_file",
+        message: job.error,
+      });
+    }
+
+    if (fileInfo.truncated) {
+      job.status = "failed";
+      job.error = "上传文件过大。";
+      return sendJson(response, 413, {
+        error: "file_too_large",
+        message: job.error,
+      });
+    }
+
+    if (response.destroyed) {
+      return;
+    }
+
+    job.inputPath = fileInfo.path;
+    job.status = "processing";
+    job.progress = 50;
+
     sendJson(response, 200, { jobId });
 
-    // 后台运行分离任务
     runDemucsForSeparate(job)
       .then((urls) => {
         job.status = "completed";
@@ -776,6 +732,89 @@ async function handleSeparateByFile(request, response, contentType) {
       message: error.message || "分轨处理失败。",
     });
   }
+}
+
+function receiveUploadedFile(request, contentType, job, contentLength) {
+  return new Promise((resolve, reject) => {
+    let fileInfo = null;
+    let outputStream = null;
+    let writeDone = null;
+    let fileSize = 0;
+    let settled = false;
+
+    const finishOnce = (callback) => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    const busboy = Busboy({
+      headers: { ...request.headers, "content-type": contentType },
+      limits: { files: 1, fileSize: MAX_UPLOAD_BYTES },
+    });
+
+    busboy.on("file", (_fieldName, file, info) => {
+      const safeName = path.basename(info.filename || "upload.audio").replace(/[^a-zA-Z0-9._-]/g, "_");
+      const uploadPath = path.join(UPLOAD_DIR, `${Date.now()}-${safeName}`);
+
+      job.fileName = safeName;
+      fileInfo = { path: uploadPath, fileName: safeName, size: 0, truncated: false };
+      outputStream = createWriteStream(uploadPath);
+      writeDone = new Promise((resolveWrite, rejectWrite) => {
+        outputStream.on("finish", resolveWrite);
+        outputStream.on("error", rejectWrite);
+      });
+
+      file.on("data", (chunk) => {
+        fileSize += chunk.length;
+        job.uploadReceived = fileSize;
+        if (contentLength > 0) {
+          job.progress = Math.min(50, Math.round((fileSize / contentLength) * 50));
+        }
+      });
+
+      file.on("limit", () => {
+        fileInfo.truncated = true;
+        file.resume();
+      });
+
+      writeDone.catch((error) => finishOnce(() => reject(error)));
+
+      file.pipe(outputStream);
+    });
+
+    busboy.on("error", (error) => {
+      finishOnce(() => reject(error));
+    });
+
+    request.on("aborted", () => {
+      job.status = "failed";
+      job.error = "上传已中断。";
+      finishOnce(() => reject(new Error(job.error)));
+    });
+
+    request.on("error", (error) => {
+      job.status = "failed";
+      job.error = error.message === "aborted" ? "上传已中断。" : (error.message || "上传中断");
+      finishOnce(() => reject(new Error(job.error)));
+    });
+
+    busboy.on("finish", () => {
+      if (!writeDone) {
+        finishOnce(() => resolve(null));
+        return;
+      }
+
+      writeDone.then(() => {
+        if (fileInfo) {
+          fileInfo.size = fileSize;
+        }
+        finishOnce(() => resolve(fileInfo));
+      }).catch((error) => finishOnce(() => reject(error)));
+    });
+
+    request.pipe(busboy);
+  });
 }
 
 async function runDemucsForSeparate(job) {
@@ -916,6 +955,7 @@ function cleanupJobLater(job, delayMs) {
 
 async function serveAllStemsZip(response, job, forceDownload = true) {
   const archive = archiver("zip", { zlib: { level: 9 } });
+  const stems = job.stems3 && Object.keys(job.stems3).length ? job.stems3 : job.stems;
 
   response.writeHead(200, {
     "Content-Type": "application/zip",
@@ -924,7 +964,7 @@ async function serveAllStemsZip(response, job, forceDownload = true) {
 
   archive.pipe(response);
 
-  for (const [stemName, filePath] of Object.entries(job.stems)) {
+  for (const [stemName, filePath] of Object.entries(stems || {})) {
     try {
       const statResult = await stat(filePath);
       if (statResult.isFile()) {

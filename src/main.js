@@ -87,11 +87,8 @@ form.addEventListener("submit", async (event) => {
 });
 
 downloadAllButton.addEventListener("click", () => {
-  if (threeStemJobId && Object.keys(threeStemUrls).length === 3) {
-    downloadAllThreeStems();
-  } else if (currentJobId) {
-    triggerDownload(`/api/download/${encodeURIComponent(currentJobId)}/all?download=1`);
-  }
+  const jobId = threeStemJobId || currentJobId;
+  if (jobId) triggerDownload(`/api/download/${encodeURIComponent(jobId)}/all?download=1`);
 });
 document.getElementById("play-all-btn").addEventListener("click", playAllStems);
 document.getElementById("stop-all-btn").addEventListener("click", stopAllStems);
@@ -288,18 +285,18 @@ async function startSeparation() {
   updateSelectionSummary();
 
   const file = selectedFile;
-  setStatus("正在上传", "Uploading", `${formatBytes(file.size)} 文件上传中...`, 2);
+  setStatus("正在上传", "Uploading", `${formatBytes(file.size)} 文件上传中...`, 0);
   console.log("[startSeparation] start, uploading", file.name);
 
   const timeout = Math.max(60000, (file.size / (1024 * 1024)) * 120000);
 
   try {
     const data = await uploadWithProgress(file, timeout);
-    console.log("[startSeparation] upload result:", data);
+    console.log("[startSeparation] upload done, data:", data);
 
     if (!data || !data.jobId) throw new Error("服务器未返回有效结果。");
 
-    // 启动轮询
+    currentJobId = data.jobId;
     console.log("[startSeparation] starting pollJob for", data.jobId);
     await pollJob(data.jobId);
   } catch (error) {
@@ -315,16 +312,37 @@ function uploadWithProgress(file, timeoutMs) {
     const formData = new FormData();
     formData.append("file", file);
 
-    const timer = setTimeout(() => {
-      xhr.abort();
-      reject(new Error("上传超时"));
-    }, timeoutMs);
+    xhr.timeout = timeoutMs;
+
+    let lastProgressTime = Date.now();
+    let stuckTimer = null;
+    let uploadFinished = false;
+
+    // 检测卡住（30 秒无进度更新）
+    function startStuckCheck() {
+      stuckTimer = setInterval(() => {
+        if (uploadFinished) {
+          clearInterval(stuckTimer);
+          return;
+        }
+        if (Date.now() - lastProgressTime > 30000) {
+          clearInterval(stuckTimer);
+          xhr.abort();
+          reject(new Error("上传已卡住（30 秒无响应），连接可能已被断开。请检查网络或尝试较小文件。"));
+        }
+      }, 10000);
+    }
 
     xhr.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) {
+        lastProgressTime = Date.now();
         const pct = Math.round((event.loaded / event.total) * 95);
-        if (pct >= 95) {
-          setStatus("正在分离", "Processing", "文件传输完成，AI 正在分离音轨，请稍候...", 95);
+        if (event.loaded >= event.total) {
+          uploadFinished = true;
+          if (stuckTimer) clearInterval(stuckTimer);
+          setStatus("正在上传", "Uploading", "文件传输完成，等待服务器确认上传...", 95);
+        } else if (pct >= 95) {
+          setStatus("正在上传", "Uploading", "文件即将传输完成...", 95);
         } else {
           setStatus("正在上传", "Uploading", `${formatBytes(file.size)} 已上传 ${formatBytes(event.loaded)} (${pct}%)`, pct);
         }
@@ -332,7 +350,7 @@ function uploadWithProgress(file, timeoutMs) {
     });
 
     xhr.addEventListener("load", () => {
-      clearTimeout(timer);
+      if (stuckTimer) clearInterval(stuckTimer);
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           const data = JSON.parse(xhr.responseText);
@@ -351,16 +369,22 @@ function uploadWithProgress(file, timeoutMs) {
     });
 
     xhr.addEventListener("error", () => {
-      clearTimeout(timer);
-      reject(new Error("网络错误，上传中断。"));
+      if (stuckTimer) clearInterval(stuckTimer);
+      reject(new Error("网络错误，上传中断。请检查网络连接后重试。"));
     });
 
     xhr.addEventListener("abort", () => {
-      clearTimeout(timer);
-      reject(new Error("上传已终止。"));
+      if (stuckTimer) clearInterval(stuckTimer);
+      reject(new Error("上传已终止（可能因连接超时）。"));
+    });
+
+    xhr.addEventListener("timeout", () => {
+      if (stuckTimer) clearInterval(stuckTimer);
+      reject(new Error("上传超时，连接可能已被断开。请检查网络或尝试较小文件。"));
     });
 
     xhr.open("POST", "/api/separate");
+    startStuckCheck();
     xhr.send(formData);
   });
 }
@@ -373,8 +397,8 @@ async function pollJob(jobId) {
         console.log("[pollJob] fetching status for", jobId);
         const res = await fetch(`/api/status/${jobId}`);
         const data = await res.json();
-        console.log("[pollJob] status:", data);
-        
+        console.log("[pollJob] status:", data.status, "progress:", data.progress);
+
         if (data.status === "failed") {
           clearInterval(interval);
           setBusy(false);
@@ -382,9 +406,8 @@ async function pollJob(jobId) {
         } else if (data.status === "completed") {
           clearInterval(interval);
           setStatus("分轨完成", "Completed", "已分离为人声、鼓组、其他三个音轨。", 100);
-          
+
           threeStemJobId = jobId;
-          // 如果服务端返回 urls
           if (data.urls) {
             threeStemUrls = {
               vocal: data.urls.vocal || `/api/download3/${jobId}/vocal`,
@@ -398,6 +421,7 @@ async function pollJob(jobId) {
               other: `/api/download3/${jobId}/other`,
             };
           }
+
           console.log("[pollJob] completed, showing stems");
 
           handleThreeStemCompletion({
@@ -408,12 +432,8 @@ async function pollJob(jobId) {
           });
           resolve();
         } else {
-          // 正在处理中
           const currentProgress = parseInt(data.progress) || 0;
-          let statusText = "AI 正在分离音轨";
-          if (data.status === "separating") statusText = "正在分离模型分析...";
-          if (data.status === "merging") statusText = "正在合并其他音轨...";
-          setStatus("正在分离", "Processing", `${statusText} (进度 ${currentProgress}%)`, currentProgress + 20 < 100 ? currentProgress + 20 : 90);
+          setStatus("正在分离", "Processing", `${data.status === "separating" ? "正在分离模型分析" : data.status === "merging" ? "正在合并其他音轨" : "AI 正在分离音轨"} (进度 ${currentProgress}%)`, currentProgress);
         }
       } catch (e) {
         console.error("Polling error:", e);
@@ -642,14 +662,6 @@ function downloadStem(stem) {
     triggerDownload(threeStemUrls[stem] + "?download=1");
   } else if (currentJobId) {
     triggerDownload(`/api/download/${encodeURIComponent(currentJobId)}/${encodeURIComponent(stem)}?download=1`);
-  }
-}
-
-function downloadAllThreeStems() {
-  for (const stem of ["vocal", "drum", "other"]) {
-    if (threeStemUrls[stem]) {
-      setTimeout(() => triggerDownload(threeStemUrls[stem] + "?download=1"), stem === "vocal" ? 0 : 500);
-    }
   }
 }
 
